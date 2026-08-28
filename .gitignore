@@ -36,3 +36,7 @@ skill-data/
 
 # IDE
 /.idea
+
+# Local agent/deployment notes (may contain private infrastructure metadata).
+/AGENTS.md
+/CLAUDE.md
