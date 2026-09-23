@@ -182,9 +182,9 @@ func TestPluginComponentsEnterExistingRuntimeAndSkillExecUsesPluginData(t *testi
 		t.Fatalf("Plugin Skill resource = %#v", resource)
 	}
 
-	command := "test -n \"$PLUGIN_DATA_DIR\" && test -z \"$SKILL_DATA_DIR\" && printf %s \"$PLUGIN_DATA_DIR\""
+	command := "test -n \"$PLUGIN_DATA_DIR\" && test -n \"$SKILL_DATA_DIR\" && printf '%s|%s' \"$PLUGIN_DATA_DIR\" \"$SKILL_DATA_DIR\""
 	if goruntime.GOOS == "windows" {
-		command = "if (-not $env:PLUGIN_DATA_DIR -or $env:SKILL_DATA_DIR) { exit 1 }; [Console]::Write($env:PLUGIN_DATA_DIR)"
+		command = "if (-not $env:PLUGIN_DATA_DIR -or -not $env:SKILL_DATA_DIR) { exit 1 }; [Console]::Write($env:PLUGIN_DATA_DIR + '|' + $env:SKILL_DATA_DIR)"
 	}
 	executed, err := rt.Call(context.Background(), "exec_command", map[string]any{
 		"cmd": command, "skill_ref": skillRef, "execution_mode": "sync",
@@ -196,16 +196,30 @@ func TestPluginComponentsEnterExistingRuntimeAndSkillExecUsesPluginData(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if executed["stdout"] != wantData {
-		t.Fatalf("PLUGIN_DATA_DIR = %#v, want %q", executed["stdout"], wantData)
+	wantSkillData, err := config.PluginSkillDataDir(rt.cfg, "demo.plugin", "plugin-skill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOutput := wantData + "|" + wantSkillData
+	if executed["stdout"] != wantOutput {
+		t.Fatalf("Plugin Skill data env = %#v, want %q", executed["stdout"], wantOutput)
 	}
 	if _, err := os.Stat(wantData); err != nil {
 		t.Fatalf("Plugin data dir not created: %v", err)
+	}
+	if _, err := os.Stat(wantSkillData); err != nil {
+		t.Fatalf("Plugin Skill data dir not created: %v", err)
 	}
 
 	_, err = rt.Call(context.Background(), "exec_command", map[string]any{
 		"cmd": commandNoopForTest(), "skill_ref": skillRef,
 		"env": map[string]any{"PLUGIN_DATA_DIR": "override"},
+	})
+	assertToolErrorCode(t, err, "INVALID_ENV_NAME")
+
+	_, err = rt.Call(context.Background(), "exec_command", map[string]any{
+		"cmd": commandNoopForTest(), "skill_ref": skillRef,
+		"env": map[string]any{"SKILL_DATA_DIR": "override"},
 	})
 	assertToolErrorCode(t, err, "INVALID_ENV_NAME")
 
@@ -278,6 +292,51 @@ func TestPluginLifecycleKeepsStandaloneMCPAndOwnsMCPEnvironment(t *testing.T) {
 		assertToolErrorCode(t, err, "VALIDATION_ERROR")
 	}
 
+	skillRef := "skill://plugin/demo.plugin/plugin-skill"
+	skillEnvResult, err := rt.Call(context.Background(), "skill_manage", map[string]any{
+		"action": "env_set", "skill_ref": skillRef, "key": "SKILL_TOKEN", "value": secret,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(fmt.Sprint(skillEnvResult), secret) {
+		t.Fatalf("Plugin Skill env_set returned secret: %#v", skillEnvResult)
+	}
+	skillEnvList, err := rt.Call(context.Background(), "skill_manage", map[string]any{
+		"action": "env_list", "skill_ref": skillRef,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(fmt.Sprint(skillEnvList), secret) {
+		t.Fatalf("Plugin Skill env_list returned secret: %#v", skillEnvList)
+	}
+	for _, reserved := range []string{"SKILL_DATA_DIR", "PLUGIN_DATA_DIR"} {
+		if _, err := rt.Call(context.Background(), "skill_manage", map[string]any{
+			"action": "env_set", "skill_ref": skillRef, "key": reserved, "value": "override",
+		}); err == nil {
+			t.Fatalf("Plugin Skill reserved env %s was configurable", reserved)
+		} else {
+			assertToolErrorCode(t, err, "VALIDATION_ERROR")
+		}
+	}
+	pluginSkillEnvPath := filepath.Join(rt.cfg.AgentDockHome, "env", "skill", "plugin", "demo.plugin", "plugin-skill.env")
+	if _, err := os.Stat(pluginSkillEnvPath); err != nil {
+		t.Fatalf("Plugin Skill env file missing: %v", err)
+	}
+	if _, err := rt.Call(context.Background(), "exec_command", map[string]any{
+		"cmd": commandNoopForTest(), "skill_ref": skillRef, "execution_mode": "sync",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pluginSkillDataDir, err := config.PluginSkillDataDir(rt.cfg, "demo.plugin", "plugin-skill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(pluginSkillDataDir); err != nil {
+		t.Fatalf("Plugin Skill data dir missing: %v", err)
+	}
+
 	if _, err := rt.Call(context.Background(), "plugin_manage", map[string]any{
 		"action": "disable", "name": "demo.plugin",
 	}); err != nil {
@@ -305,6 +364,11 @@ func TestPluginLifecycleKeepsStandaloneMCPAndOwnsMCPEnvironment(t *testing.T) {
 	if _, err := os.Stat(envPath); err != nil {
 		t.Fatalf("keep removed Plugin MCP env: %v", err)
 	}
+	for _, path := range []string{pluginSkillEnvPath, pluginSkillDataDir} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("keep removed Plugin Skill state %s: %v", path, err)
+		}
+	}
 
 	if _, err := rt.Call(context.Background(), "plugin_manage", map[string]any{
 		"action": "install", "source": source, "review_token": pluginReviewTokenForTest(t, rt, source),
@@ -325,7 +389,7 @@ func TestPluginLifecycleKeepsStandaloneMCPAndOwnsMCPEnvironment(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{envPath, dataDir} {
+	for _, path := range []string{envPath, dataDir, pluginSkillEnvPath, pluginSkillDataDir} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("purge left %s: %v", path, err)
 		}
@@ -373,6 +437,52 @@ func contextHasMap(value any, match func(map[string]any) bool) bool {
 		}
 	}
 	return false
+}
+
+func TestPluginInstallRuntimeActivationFailureNeverPublishesPluginOrSkill(t *testing.T) {
+	rt, root := newPluginTestRuntime(t)
+	collision := pluginruntime.RuntimeMCPName("demo.plugin", "remote")
+	if _, err := rt.Call(context.Background(), "mcp_manage", map[string]any{
+		"action": "add", "name": collision, "description": "Standalone collision",
+		"transport": "streamable_http", "url": "http://127.0.0.1:1/mcp",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	source := writeAppPluginForTest(t, root, "1.0.0")
+	_, err := rt.Call(context.Background(), "plugin_manage", map[string]any{
+		"action": "install", "source": source, "review_token": pluginReviewTokenForTest(t, rt, source),
+	})
+	assertToolErrorCode(t, err, "PLUGIN_RUNTIME_ACTIVATION_FAILED")
+
+	if _, inspectErr := rt.Call(context.Background(), "plugin_manage", map[string]any{
+		"action": "inspect", "name": "demo.plugin",
+	}); inspectErr == nil {
+		t.Fatal("failed install became visible as an installed Plugin")
+	}
+	contextResult, err := rt.AgentDockContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contextHasMap(contextResult["skills"], func(item map[string]any) bool {
+		return item["plugin_name"] == "demo.plugin"
+	}) {
+		t.Fatalf("failed install exposed Plugin Skill through agentdock_context: %#v", contextResult["skills"])
+	}
+	packagePath := filepath.Join(rt.cfg.AgentDockHome, "plugins", "demo.plugin", "1.0.0")
+	if _, statErr := os.Stat(packagePath); !os.IsNotExist(statErr) {
+		t.Fatalf("failed install left candidate package at %s: %v", packagePath, statErr)
+	}
+	listed, err := rt.Call(context.Background(), "mcp_manage", map[string]any{"action": "list"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	standalone := findContextMap(t, listed["servers"], func(item map[string]any) bool {
+		return item["name"] == collision
+	})
+	if standalone["source_type"] != "standalone" {
+		t.Fatalf("failed Plugin install replaced standalone MCP ownership: %#v", standalone)
+	}
 }
 
 func TestPluginUpdateRuntimeActivationFailureRestoresPreviousPackageAndStandaloneMCP(t *testing.T) {
