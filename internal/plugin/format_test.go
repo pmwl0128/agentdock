@@ -49,10 +49,10 @@ func TestOpenAIPluginAutoConvertsWithoutAdapterParameter(t *testing.T) {
 	if !review.Valid {
 		t.Fatalf("OpenAI review invalid: %#v", review)
 	}
-	if review.Compatibility.Format != pluginFormatOpenAI {
-		t.Fatalf("compatibility = %#v", review.Compatibility)
+	if review.Format != pluginFormatOpenAI {
+		t.Fatalf("format = %q", review.Format)
 	}
-	if review.Provenance == nil || review.Provenance.Format != pluginFormatOpenAI || !review.Provenance.Adapted {
+	if review.Provenance == nil {
 		t.Fatalf("provenance = %#v", review.Provenance)
 	}
 	if !strings.HasPrefix(review.Provenance.Origin, "sha256:") {
@@ -64,10 +64,6 @@ func TestOpenAIPluginAutoConvertsWithoutAdapterParameter(t *testing.T) {
 	if !containsText(review.Warnings, "commands") || !containsText(review.Warnings, "metadata field note") {
 		t.Fatalf("expected conversion warnings, got %#v", review.Warnings)
 	}
-	if len(review.Unsupported) != 0 {
-		t.Fatalf("unexpected unsupported components: %#v", review.Unsupported)
-	}
-
 	result, err := manager.InstallReviewedSource(context.Background(), root, true, review.ReviewToken)
 	if err != nil {
 		t.Fatal(err)
@@ -79,20 +75,210 @@ func TestOpenAIPluginAutoConvertsWithoutAdapterParameter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if installed.Compatibility.Format != pluginFormatOpenAI {
-		t.Fatalf("installed compatibility = %#v", installed.Compatibility)
+	if installed.Format != pluginFormatOpenAI {
+		t.Fatalf("installed format = %q", installed.Format)
 	}
-	if installed.Provenance == nil || installed.Provenance.Format != pluginFormatOpenAI {
+	if installed.Provenance == nil {
 		t.Fatalf("installed provenance = %#v", installed.Provenance)
 	}
 	if !regularFileExists(filepath.Join(installed.Root, "plugin.json")) ||
 		!regularFileExists(filepath.Join(installed.Root, "mcp.json")) {
 		t.Fatalf("installed package is not canonical Portable layout: %s", installed.Root)
 	}
-	for _, omitted := range []string{".codex-plugin", ".mcp.json", "commands"} {
-		if _, err := os.Lstat(filepath.Join(installed.Root, omitted)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("canonical OpenAI package retained consumed artifact %s: %v", omitted, err)
+	for _, preserved := range []string{".codex-plugin", ".mcp.json", "commands"} {
+		if _, err := os.Lstat(filepath.Join(installed.Root, preserved)); err != nil {
+			t.Fatalf("canonical OpenAI package lost preserved source artifact %s: %v", preserved, err)
 		}
+	}
+}
+
+func TestExternalPluginImportMetadataBecomesCanonicalProvenance(t *testing.T) {
+	manager, err := NewManager(filepath.Join(t.TempDir(), ".agentdock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	writeExternalJSONFile(t, filepath.Join(root, ".codex-plugin", "plugin.json"), map[string]any{
+		"name":       "openai-provenance",
+		"version":    "1.0.0",
+		"repository": "https://github.com/upstream/example",
+	})
+	writeExternalJSONFile(t, filepath.Join(root, pluginImportMetadataFile), map[string]any{
+		"origin":   "https://github.com/example/fork",
+		"ref":      "main",
+		"revision": "0123456789abcdef",
+		"subdir":   "plugins/openai-provenance",
+	})
+
+	review := manager.Validate(root)
+	if !review.Valid {
+		t.Fatalf("review invalid: %#v", review)
+	}
+	want := Provenance{
+		Origin: "https://github.com/example/fork", Ref: "main",
+		Revision: "0123456789abcdef", Subdir: "plugins/openai-provenance",
+	}
+	if review.Provenance == nil || *review.Provenance != want {
+		t.Fatalf("review provenance = %#v, want %#v", review.Provenance, want)
+	}
+	if !regularFileExists(filepath.Join(root, pluginImportMetadataFile)) {
+		t.Fatal("validate mutated the original import sidecar")
+	}
+
+	result, err := manager.InstallReviewedSource(context.Background(), root, true, review.ReviewToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.FinalizeActivation(result.Name); err != nil {
+		t.Fatal(err)
+	}
+	installed, err := manager.Inspect(result.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installed.Provenance == nil || *installed.Provenance != want {
+		t.Fatalf("installed provenance = %#v, want %#v", installed.Provenance, want)
+	}
+	if _, err := os.Lstat(filepath.Join(installed.Root, pluginImportMetadataFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("installed Plugin retained import sidecar: %v", err)
+	}
+}
+
+func TestPortablePluginImportMetadataBecomesProvenance(t *testing.T) {
+	manager, err := NewManager(filepath.Join(t.TempDir(), ".agentdock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	writeExternalJSONFile(t, filepath.Join(root, "plugin.json"), map[string]any{
+		"$schema": pluginSchemaURI,
+		"name":    "portable-provenance",
+		"version": "1.0.0",
+	})
+	writeExternalJSONFile(t, filepath.Join(root, pluginImportMetadataFile), map[string]any{
+		"origin": "https://github.com/example/portable",
+		"ref":    "v1",
+	})
+
+	review := manager.Validate(root)
+	if !review.Valid {
+		t.Fatalf("review invalid: %#v", review)
+	}
+	if review.Provenance == nil ||
+		review.Provenance.Origin != "https://github.com/example/portable" ||
+		review.Provenance.Ref != "v1" ||
+		review.Format != pluginFormatPortable {
+		t.Fatalf("portable provenance = %#v", review.Provenance)
+	}
+}
+
+func TestClaudePluginImportMetadataKeepsVerifiedSourceIdentity(t *testing.T) {
+	manager, err := NewManager(filepath.Join(t.TempDir(), ".agentdock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	writeExternalJSONFile(t, filepath.Join(root, ".claude-plugin", "plugin.json"), map[string]any{
+		"name": "claude-provenance", "version": "1.0.0",
+	})
+	writeExternalJSONFile(t, filepath.Join(root, pluginImportMetadataFile), map[string]any{
+		"origin":   "https://github.com/anthropics/claude-plugins-official",
+		"ref":      "main",
+		"revision": "abcdef0123456789",
+		"subdir":   "external_plugins/context7",
+	})
+
+	review := manager.Validate(root)
+	if !review.Valid {
+		t.Fatalf("review invalid: %#v", review)
+	}
+	if review.Provenance == nil ||
+		review.Provenance.Origin != "https://github.com/anthropics/claude-plugins-official" ||
+		review.Provenance.Ref != "main" ||
+		review.Provenance.Revision != "abcdef0123456789" ||
+		review.Provenance.Subdir != "external_plugins/context7" {
+		t.Fatalf("Claude provenance = %#v", review.Provenance)
+	}
+}
+
+func TestPluginImportMetadataRejectsUntrustedFieldsAndUnsafeOrigin(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata map[string]any
+		want     string
+	}{
+		{
+			name:     "unknown field",
+			metadata: map[string]any{"origin": "https://github.com/example/repo", "format": "claude"},
+			want:     "unknown field",
+		},
+		{
+			name:     "missing origin",
+			metadata: map[string]any{"revision": "0123456789abcdef"},
+			want:     "provenance.origin is required",
+		},
+		{
+			name:     "credentialed origin",
+			metadata: map[string]any{"origin": "https://token@github.com/example/repo"},
+			want:     "must not contain userinfo",
+		},
+		{
+			name:     "escaping subdir",
+			metadata: map[string]any{"origin": "https://github.com/example/repo", "subdir": "../escape"},
+			want:     "provenance.subdir",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager, err := NewManager(filepath.Join(t.TempDir(), ".agentdock"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := t.TempDir()
+			writeExternalJSONFile(t, filepath.Join(root, ".claude-plugin", "plugin.json"), map[string]any{
+				"name": "claude-invalid-provenance", "version": "1.0.0",
+			})
+			writeExternalJSONFile(t, filepath.Join(root, pluginImportMetadataFile), test.metadata)
+
+			review := manager.Validate(root)
+			if review.Valid || !containsText(review.Issues, test.want) {
+				t.Fatalf("review = %#v, want issue containing %q", review, test.want)
+			}
+		})
+	}
+}
+
+func TestPluginImportMetadataChangesReviewIdentity(t *testing.T) {
+	manager, err := NewManager(filepath.Join(t.TempDir(), ".agentdock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	writeExternalJSONFile(t, filepath.Join(root, "plugin.json"), map[string]any{
+		"$schema": pluginSchemaURI,
+		"name":    "portable-review-identity",
+		"version": "1.0.0",
+	})
+	writeExternalJSONFile(t, filepath.Join(root, pluginImportMetadataFile), map[string]any{
+		"origin":   "https://github.com/example/portable",
+		"ref":      "main",
+		"revision": "rev-a",
+	})
+	first := manager.Validate(root)
+	if !first.Valid {
+		t.Fatalf("first review invalid: %#v", first)
+	}
+	writeExternalJSONFile(t, filepath.Join(root, pluginImportMetadataFile), map[string]any{
+		"origin":   "https://github.com/example/portable",
+		"ref":      "main",
+		"revision": "rev-b",
+	})
+	second := manager.Validate(root)
+	if !second.Valid {
+		t.Fatalf("second review invalid: %#v", second)
+	}
+	if first.PackageDigest == second.PackageDigest || first.ReviewToken == second.ReviewToken {
+		t.Fatalf("source identity change did not invalidate review: first=%#v second=%#v", first.Provenance, second.Provenance)
 	}
 }
 
@@ -106,16 +292,29 @@ func TestOpenAIPluginZIPWithWrapperDirectoryAutoConverts(t *testing.T) {
 		"name": "openai-zip", "version": "1.0.0", "skills": "./skills/",
 	})
 	writeExternalSkill(t, filepath.Join(source, "skills", "zip-skill"), "zip-skill")
+	writeExternalJSONFile(t, filepath.Join(source, pluginImportMetadataFile), map[string]any{
+		"origin":   "https://github.com/example/openai-plugins",
+		"ref":      "main",
+		"revision": "0123456789abcdef",
+		"subdir":   "plugins/openai-zip",
+	})
 
 	archive := filepath.Join(t.TempDir(), "openai.zip")
 	writeWrappedPluginZip(t, archive, "openai-plugin", source)
 
 	review := manager.Validate(archive)
-	if !review.Valid || review.Name != "openai-zip" || review.Compatibility.Format != pluginFormatOpenAI {
+	if !review.Valid || review.Name != "openai-zip" || review.Format != pluginFormatOpenAI {
 		t.Fatalf("wrapped OpenAI ZIP review = %#v", review)
 	}
 	if len(review.Skills) != 1 || review.Skills[0].Name != "zip-skill" {
 		t.Fatalf("wrapped ZIP skills = %#v", review.Skills)
+	}
+	if review.Provenance == nil ||
+		review.Provenance.Origin != "https://github.com/example/openai-plugins" ||
+		review.Provenance.Ref != "main" ||
+		review.Provenance.Revision != "0123456789abcdef" ||
+		review.Provenance.Subdir != "plugins/openai-zip" {
+		t.Fatalf("wrapped ZIP provenance = %#v", review.Provenance)
 	}
 	result, err := manager.InstallReviewedSource(context.Background(), archive, true, review.ReviewToken)
 	if err != nil {
@@ -128,8 +327,11 @@ func TestOpenAIPluginZIPWithWrapperDirectoryAutoConverts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if installed.PackageDigest != review.PackageDigest || installed.Compatibility.Format != pluginFormatOpenAI {
+	if installed.PackageDigest != review.PackageDigest || installed.Format != pluginFormatOpenAI {
 		t.Fatalf("wrapped ZIP installed state = %#v review=%#v", installed.State, review)
+	}
+	if _, err := os.Lstat(filepath.Join(installed.Root, pluginImportMetadataFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("wrapped ZIP installed Plugin retained import sidecar: %v", err)
 	}
 }
 
@@ -164,10 +366,10 @@ func TestClaudePluginAutoConvertsRuntimePlaceholders(t *testing.T) {
 	})
 
 	review := manager.Validate(root)
-	if !review.Valid || review.Compatibility.Format != pluginFormatClaude {
+	if !review.Valid || review.Format != pluginFormatClaude {
 		t.Fatalf("Claude review = %#v", review)
 	}
-	if review.Provenance == nil || review.Provenance.Format != pluginFormatClaude || !review.Provenance.Adapted {
+	if review.Provenance == nil {
 		t.Fatalf("Claude provenance = %#v", review.Provenance)
 	}
 	if len(review.Skills) != 1 || review.Skills[0].Name != "root-skill" || len(review.MCP) != 1 {
@@ -195,9 +397,9 @@ func TestClaudePluginAutoConvertsRuntimePlaceholders(t *testing.T) {
 		mcp.EnvBindings["TOKEN"] != "TOKEN" {
 		t.Fatalf("Claude placeholders were not normalized: %#v", mcp)
 	}
-	for _, consumed := range []string{".claude-plugin", ".mcp.json"} {
-		if _, err := os.Lstat(filepath.Join(installed.Root, consumed)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("canonical Claude package retained consumed artifact %s: %v", consumed, err)
+	for _, preserved := range []string{".claude-plugin", ".mcp.json"} {
+		if _, err := os.Lstat(filepath.Join(installed.Root, preserved)); err != nil {
+			t.Fatalf("canonical Claude package lost preserved source artifact %s: %v", preserved, err)
 		}
 	}
 }
@@ -221,7 +423,7 @@ func TestClaudePluginAutoConvertsSkillAllowedToolsArray(t *testing.T) {
 	}
 
 	review := manager.Validate(root)
-	if !review.Valid || review.Compatibility.Format != pluginFormatClaude {
+	if !review.Valid || review.Format != pluginFormatClaude {
 		t.Fatalf("Claude allowed-tools review = %#v", review)
 	}
 	result, err := manager.InstallReviewedSource(context.Background(), root, true, review.ReviewToken)
@@ -239,8 +441,15 @@ func TestClaudePluginAutoConvertsSkillAllowedToolsArray(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if doc.AllowedTools != "Read Write Bash(ls *)" {
-		t.Fatalf("normalized allowed-tools = %q", doc.AllowedTools)
+	if doc.Name != "access" {
+		t.Fatalf("installed Skill identity = %#v", doc)
+	}
+	installedSkill, err := os.ReadFile(filepath.Join(installed.Root, "skills", "access", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(installedSkill) != sourceSkill {
+		t.Fatalf("third-party Skill frontmatter was rewritten:\n%s", installedSkill)
 	}
 	original, err := os.ReadFile(filepath.Join(skillRoot, "SKILL.md"))
 	if err != nil {
@@ -273,7 +482,7 @@ func TestAutoConversionRejectsAmbiguousVendorManifests(t *testing.T) {
 	}
 }
 
-func TestAutoConversionKeepsUnknownMCPAuthAsUnsupported(t *testing.T) {
+func TestAutoConversionPreservesUnknownMCPAuthWithoutActivation(t *testing.T) {
 	manager, err := NewManager(filepath.Join(t.TempDir(), ".agentdock"))
 	if err != nil {
 		t.Fatal(err)
@@ -293,11 +502,31 @@ func TestAutoConversionKeepsUnknownMCPAuthAsUnsupported(t *testing.T) {
 	})
 
 	review := manager.Validate(root)
-	if review.Valid {
-		t.Fatalf("unknown MCP auth behavior was accepted: %#v", review)
+	if !review.Valid {
+		t.Fatalf("unknown MCP auth should not invalidate package: %#v", review)
 	}
-	if !containsText(review.Unsupported, "oauth_resource") {
-		t.Fatalf("unsupported MCP auth field missing: %#v", review.Unsupported)
+	if len(review.MCP) != 0 || !containsText(review.Warnings, "oauth_resource") || !containsText(review.Warnings, "not activated") {
+		t.Fatalf("unknown MCP auth was not isolated: %#v", review)
+	}
+	result, err := manager.InstallReviewedSource(context.Background(), root, true, review.ReviewToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.FinalizeActivation(result.Name); err != nil {
+		t.Fatal(err)
+	}
+	installed, err := manager.Inspect(result.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(installed.Components.MCP) != 0 {
+		t.Fatalf("unknown MCP auth became active: %#v", installed.Components.MCP)
+	}
+	if !containsText(installed.Warnings, "oauth_resource") || !containsText(installed.Warnings, "not activated") {
+		t.Fatalf("installed state lost review warning: %#v", installed.Warnings)
+	}
+	if _, err := os.Stat(filepath.Join(installed.Root, ".mcp.json")); err != nil {
+		t.Fatalf("source MCP config was not preserved: %v", err)
 	}
 }
 
