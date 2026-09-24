@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	goruntime "runtime"
@@ -100,6 +102,91 @@ func pluginReviewTokenForTest(t *testing.T, rt *Runtime, source string) string {
 	return review.ReviewToken
 }
 
+func TestPluginRemoteOptionalHeaderAllowsAnonymousRuntime(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if got := request.URL.Query().Get("client"); got != "claude-code-plugin" {
+			t.Errorf("client query = %q", got)
+		}
+		if got := request.Header.Get("Authorization"); got != "" {
+			t.Errorf("Authorization = %q, want omitted header", got)
+		}
+		if request.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		var rpc struct {
+			ID     any    `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&rpc); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch rpc.Method {
+		case "server/discover":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      rpc.ID,
+				"error":   map[string]any{"code": -32601, "message": "Method not found"},
+			})
+		case "initialize":
+			writeDynamicMCPRPCResult(t, w, rpc.ID, map[string]any{
+				"protocolVersion": "2025-11-25",
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo":      map[string]any{"name": "plugin-upstream", "version": "1.0.0"},
+			})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			writeDynamicMCPRPCResult(t, w, rpc.ID, map[string]any{
+				"tools": []map[string]any{{
+					"name":        "ping",
+					"description": "Ping",
+					"inputSchema": map[string]any{"type": "object"},
+				}},
+			})
+		default:
+			t.Errorf("unexpected upstream method %q", rpc.Method)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	rt, root := newPluginTestRuntime(t)
+	source := writeAppPluginForTest(t, root, "1.0.0")
+	writeAppPluginJSON(t, filepath.Join(source, "mcp.json"), map[string]any{
+		"$schema": testMCPSchema,
+		"mcpServers": map[string]any{
+			"remote": map[string]any{
+				"type": "streamable-http",
+				"url":  upstream.URL + "?client=claude-code-plugin",
+				"headers": map[string]string{
+					"Authorization": "${CONTEXT7_API_KEY:-}",
+				},
+			},
+		},
+	})
+	if _, err := rt.Call(context.Background(), "plugin_manage", map[string]any{
+		"action": "install", "source": source, "review_token": pluginReviewTokenForTest(t, rt, source),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runtimeName := pluginruntime.RuntimeMCPName("demo.plugin", "remote")
+	search, err := rt.Call(context.Background(), "mcp_tool_search", map[string]any{
+		"server": runtimeName, "query": "ping", "limit": 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if search["count"] != 1 {
+		t.Fatalf("mcp_tool_search = %#v", search)
+	}
+}
+
 func TestPluginComponentsEnterExistingRuntimeAndSkillExecUsesPluginData(t *testing.T) {
 	rt, root := newPluginTestRuntime(t)
 	source := writeAppPluginForTest(t, root, "1.0.0")
@@ -129,6 +216,16 @@ func TestPluginComponentsEnterExistingRuntimeAndSkillExecUsesPluginData(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	plugin := findContextMap(t, contextResult["plugins"], func(item map[string]any) bool {
+		return item["name"] == "demo.plugin"
+	})
+	if plugin["version"] != "1.0.0" || plugin["enabled"] != true ||
+		plugin["description"] != "Plugin integration test." ||
+		plugin["skills_count"] != float64(1) || plugin["mcp_count"] != float64(1) ||
+		plugin["format"] != "portable" || plugin["adapted"] != false {
+		t.Fatalf("Plugin context summary = %#v", plugin)
+	}
+
 	skill := findContextMap(t, contextResult["skills"], func(item map[string]any) bool {
 		return item["name"] == "plugin-skill" && item["source_type"] == "plugin"
 	})
@@ -346,6 +443,12 @@ func TestPluginLifecycleKeepsStandaloneMCPAndOwnsMCPEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	disabledPlugin := findContextMap(t, contextResult["plugins"], func(item map[string]any) bool {
+		return item["name"] == "demo.plugin"
+	})
+	if disabledPlugin["enabled"] != false {
+		t.Fatalf("disabled Plugin disappeared or stayed enabled in Plugin index: %#v", disabledPlugin)
+	}
 	if contextHasMap(contextResult["skills"], func(item map[string]any) bool { return item["source_type"] == "plugin" }) {
 		t.Fatalf("disabled Plugin Skill remained in context: %#v", contextResult["skills"])
 	}
@@ -400,6 +503,9 @@ func TestPluginLifecycleKeepsStandaloneMCPAndOwnsMCPEnvironment(t *testing.T) {
 	}
 	if !contextHasMap(finalContext["dynamic_mcp"], func(item map[string]any) bool { return item["name"] == "standalone" }) {
 		t.Fatalf("Plugin remove affected standalone MCP: %#v", finalContext["dynamic_mcp"])
+	}
+	if contextHasMap(finalContext["plugins"], func(item map[string]any) bool { return item["name"] == "demo.plugin" }) {
+		t.Fatalf("removed Plugin remained in Plugin context index: %#v", finalContext["plugins"])
 	}
 }
 
@@ -521,7 +627,7 @@ func TestPluginUpdateRuntimeActivationFailureRestoresPreviousPackageAndStandalon
 	}
 	sourceV2 := writeAppPluginForTest(t, v2Root, "2.0.0")
 	_, err = rt.Call(context.Background(), "plugin_manage", map[string]any{
-		"action": "update", "source": sourceV2, "review_token": pluginReviewTokenForTest(t, rt, sourceV2), "confirmed_source_change": true,
+		"action": "update", "source": sourceV2, "review_token": pluginReviewTokenForTest(t, rt, sourceV2),
 	})
 	assertToolErrorCode(t, err, "PLUGIN_RUNTIME_ACTIVATION_FAILED")
 
@@ -586,7 +692,7 @@ func TestPluginPurgeRemovesEnvironmentFromMCPRemovedByUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := rt.Call(context.Background(), "plugin_manage", map[string]any{
-		"action": "update", "source": sourceV2, "review_token": pluginReviewTokenForTest(t, rt, sourceV2), "confirmed_source_change": true,
+		"action": "update", "source": sourceV2, "review_token": pluginReviewTokenForTest(t, rt, sourceV2),
 	}); err != nil {
 		t.Fatal(err)
 	}

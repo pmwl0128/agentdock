@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -57,6 +58,9 @@ func LoadPackage(root string) (Package, error) {
 	skillRoot := filepath.Join(root, "skills")
 	if entries, readErr := os.ReadDir(skillRoot); readErr == nil {
 		for _, entry := range entries {
+			if skills.IsIgnoredPackageMetadataPath(entry.Name()) {
+				continue
+			}
 			if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
 				return Package{}, pluginError("PLUGIN_PACKAGE_INVALID", "skills", fmt.Errorf("skills/%s must be a regular directory", entry.Name()))
 			}
@@ -109,9 +113,26 @@ func LoadPackage(root string) (Package, error) {
 	unsupported = append(unsupported, treeUnsupported...)
 	sort.Strings(unsupported)
 	unsupported = uniqueStrings(unsupported)
+	sort.Strings(warnings)
+	warnings = uniqueStrings(warnings)
+
+	supported := []string{"metadata"}
+	if len(components.Skills) > 0 {
+		supported = append(supported, "skills")
+	}
+	if len(components.MCP) > 0 {
+		supported = append(supported, "mcp")
+	}
+	sort.Strings(supported)
+	compatibility := Compatibility{
+		Format: "portable", Supported: supported,
+		Unsupported: append([]string(nil), unsupported...),
+		Warnings:    append([]string(nil), warnings...),
+	}
 	return Package{
 		Root: root, Manifest: manifest, PackageDigest: digest,
 		Components: components, Unsupported: unsupported, Warnings: warnings, Executables: executables,
+		Compatibility: compatibility,
 	}, nil
 }
 
@@ -173,7 +194,7 @@ func loadManifest(path string) (Manifest, []string, []string, error) {
 	warnings := make([]string, 0)
 	if version == "" {
 		version = VersionLocal
-		warnings = append(warnings, "plugin.json omits version; local portable source is treated as version=local")
+		warnings = append(warnings, "plugin.json omits version; Portable Plugin is treated as version=local")
 	}
 	if err := ValidateVersion(version); err != nil {
 		return Manifest{}, nil, nil, pluginError("PLUGIN_MANIFEST_INVALID", "manifest.version", err)
@@ -220,6 +241,25 @@ func loadManifest(path string) (Manifest, []string, []string, error) {
 		}
 		manifest.Author = author
 	}
+	if value, ok := raw["provenance"]; ok && !isJSONEmpty(value) {
+		var provenance Provenance
+		decoder := json.NewDecoder(bytes.NewReader(value))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&provenance); err != nil {
+			return Manifest{}, nil, nil, pluginError("PLUGIN_MANIFEST_INVALID", "manifest.provenance", fmt.Errorf("invalid provenance: %w", err))
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+			if err == nil {
+				err = errors.New("provenance contains trailing JSON")
+			}
+			return Manifest{}, nil, nil, pluginError("PLUGIN_MANIFEST_INVALID", "manifest.provenance", err)
+		}
+		if err := validateProvenance(&provenance); err != nil {
+			return Manifest{}, nil, nil, pluginError("PLUGIN_MANIFEST_INVALID", "manifest.provenance", err)
+		}
+		manifest.Provenance = &provenance
+	}
 	extensionUnsupported := make([]string, 0)
 	if value, ok := raw["extensions"]; ok {
 		var extensions map[string]json.RawMessage
@@ -240,7 +280,7 @@ func loadManifest(path string) (Manifest, []string, []string, error) {
 
 	known := map[string]struct{}{
 		"$schema": {}, "name": {}, "version": {}, "description": {}, "author": {},
-		"homepage": {}, "repository": {}, "license": {}, "keywords": {}, "extensions": {},
+		"homepage": {}, "repository": {}, "license": {}, "keywords": {}, "provenance": {}, "extensions": {},
 	}
 	unsupported := append([]string(nil), extensionUnsupported...)
 	for key, value := range raw {
@@ -263,6 +303,60 @@ func loadManifest(path string) (Manifest, []string, []string, error) {
 	return manifest, unsupported, warnings, nil
 }
 
+func validateProvenance(provenance *Provenance) error {
+	if provenance == nil {
+		return nil
+	}
+	provenance.Origin = strings.TrimSpace(provenance.Origin)
+	provenance.Revision = strings.TrimSpace(provenance.Revision)
+	provenance.Subdir = strings.TrimSpace(strings.ReplaceAll(provenance.Subdir, "\\", "/"))
+	provenance.Format = strings.TrimSpace(provenance.Format)
+	for field, value := range map[string]string{
+		"origin": provenance.Origin, "revision": provenance.Revision,
+		"subdir": provenance.Subdir, "format": provenance.Format,
+	} {
+		if containsControlCharacter(value) {
+			return fmt.Errorf("provenance.%s must not contain control characters", field)
+		}
+	}
+	if provenance.Origin == "" {
+		return errors.New("provenance.origin is required")
+	}
+	parsedOrigin, err := url.Parse(provenance.Origin)
+	if err != nil {
+		return fmt.Errorf("provenance.origin is invalid: %w", err)
+	}
+	if parsedOrigin.Scheme == "http" || parsedOrigin.Scheme == "https" {
+		if parsedOrigin.User != nil {
+			return errors.New("provenance.origin HTTP(S) URL must not contain userinfo")
+		}
+		if parsedOrigin.RawQuery != "" || parsedOrigin.Fragment != "" {
+			return errors.New("provenance.origin HTTP(S) URL must not contain query parameters or fragments")
+		}
+	} else if parsedOrigin.User != nil {
+		if _, hasPassword := parsedOrigin.User.Password(); hasPassword {
+			return errors.New("provenance.origin must not contain a password")
+		}
+	}
+	if provenance.Subdir != "" {
+		clean, err := cleanPluginRelativePath(provenance.Subdir)
+		if err != nil {
+			return fmt.Errorf("provenance.subdir: %w", err)
+		}
+		provenance.Subdir = clean
+	}
+	return nil
+}
+
+func containsControlCharacter(value string) bool {
+	for _, char := range value {
+		if char < 0x20 || char == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
 func validatePackageTree(root string) ([]string, error) {
 	unsupportedRoots := map[string]string{
 		"hooks": "hooks", "agents": "agents", "lsp": "lsp", "monitors": "monitors",
@@ -281,6 +375,13 @@ func validatePackageTree(root string) ([]string, error) {
 		relative, err := filepath.Rel(root, path)
 		if err != nil {
 			return pluginError("PLUGIN_PACKAGE_INVALID", "package.path", err)
+		}
+		relative = filepath.ToSlash(relative)
+		if skills.IsIgnoredPackageMetadataPath(relative) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if entry.IsDir() {
 			if label, exists := unsupportedRoots[filepath.ToSlash(relative)]; exists {
@@ -314,11 +415,25 @@ func collectExecutableFiles(root string) ([]string, error) {
 		if walkErr != nil {
 			return walkErr
 		}
-		if path == root || entry.IsDir() {
+		if path == root {
 			return nil
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("symlink is not allowed: %s", path)
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		if skills.IsIgnoredPackageMetadataPath(relative) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			return nil
 		}
 		info, err := entry.Info()
 		if err != nil {
@@ -327,13 +442,9 @@ func collectExecutableFiles(root string) ([]string, error) {
 		if !info.Mode().IsRegular() {
 			return nil
 		}
-		relative, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
 		ext := strings.ToLower(filepath.Ext(entry.Name()))
 		if info.Mode().Perm()&0o111 != 0 || ext == ".exe" || ext == ".cmd" || ext == ".bat" || ext == ".ps1" {
-			items = append(items, filepath.ToSlash(relative))
+			items = append(items, relative)
 		}
 		return nil
 	})

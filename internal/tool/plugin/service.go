@@ -31,6 +31,38 @@ type Service struct {
 	mcpLeases  map[string]func()
 }
 
+type CapabilityItem struct {
+	Name        string
+	Version     string
+	Enabled     bool
+	Description string
+	SkillsCount int
+	MCPCount    int
+	Format      string
+	Adapted     bool
+}
+
+func (s *Service) CapabilityItems() ([]CapabilityItem, error) {
+	installed, err := s.manager.List()
+	if err != nil {
+		return []CapabilityItem{}, err
+	}
+	items := make([]CapabilityItem, 0, len(installed))
+	for _, item := range installed {
+		format := strings.TrimSpace(item.Compatibility.Format)
+		if format == "" {
+			format = "portable"
+		}
+		items = append(items, CapabilityItem{
+			Name: item.Name, Version: item.Version, Enabled: item.Enabled,
+			Description: item.Description,
+			SkillsCount: len(item.Components.Skills), MCPCount: len(item.Components.MCP),
+			Format: format, Adapted: item.Provenance != nil && item.Provenance.Adapted,
+		})
+	}
+	return items, nil
+}
+
 func New(cfg config.Config, manager *pluginruntime.Manager, mcpClients *mcpclient.Manager, envs *envstore.Store, ws *workspace.Workspace) *Service {
 	return &Service{
 		cfg: cfg, manager: manager, mcpClients: mcpClients, envs: envs, ws: ws,
@@ -112,7 +144,7 @@ func (s *Service) Manage(ctx context.Context, request ManageRequest) (Result, er
 		for _, item := range items {
 			plugins = append(plugins, map[string]any{
 				"name": item.Name, "version": item.Version, "enabled": item.Enabled,
-				"package_digest": item.PackageDigest, "source": item.Source,
+				"package_digest": item.PackageDigest, "provenance": item.Provenance,
 				"skill_count": len(item.Components.Skills), "mcp_count": len(item.Components.MCP),
 			})
 		}
@@ -128,8 +160,6 @@ func (s *Service) Manage(ctx context.Context, request ManageRequest) (Result, er
 			return nil, pluginToolError(err)
 		}
 		review := s.manager.Validate(installed.Root)
-		review.Source = installed.Source
-		review.Compatibility = installed.Compatibility
 		if !review.Valid || review.PackageDigest != installed.PackageDigest {
 			return nil, toolcore.NewErrorDetails(
 				"PLUGIN_PACKAGE_DRIFT",
@@ -143,39 +173,27 @@ func (s *Service) Manage(ctx context.Context, request ManageRequest) (Result, er
 			"enabled": installed.Enabled, "package_digest": installed.PackageDigest,
 			"plugin": map[string]any{
 				"name": installed.Name, "version": installed.Version, "description": review.Description,
-				"source": installed.Source, "enabled": installed.Enabled, "installed_at": installed.InstalledAt,
+				"provenance": installed.Provenance, "enabled": installed.Enabled, "installed_at": installed.InstalledAt,
 				"package_digest": installed.PackageDigest, "skills": review.Skills,
 				"mcp": review.MCP, "executables": review.Executables,
-				"warnings": review.Warnings, "unsupported": review.Unsupported,
-				"compatibility": review.Compatibility,
+				"warnings": installed.Compatibility.Warnings, "unsupported": installed.Compatibility.Unsupported,
+				"compatibility": installed.Compatibility,
 			},
 		}, nil
 
 	case "validate":
-		sourceRequest, err := s.sourceRequest(request)
+		source, err := s.sourcePath(request.Source)
 		if err != nil {
 			return nil, err
 		}
-		review := s.manager.ValidateSource(ctx, sourceRequest)
+		review := s.manager.ValidateSource(ctx, source)
 		return Result{
 			"action": action, "review": review,
 			"package_digest": review.PackageDigest, "review_token": review.ReviewToken,
 		}, nil
 
-	case "catalog":
-		sourceRequest, err := s.sourceRequest(request)
-		if err != nil {
-			return nil, err
-		}
-		sourceRequest.CatalogItem = ""
-		catalog, err := s.manager.LoadCatalog(ctx, sourceRequest)
-		if err != nil {
-			return nil, pluginToolError(err)
-		}
-		return Result{"action": action, "catalog": catalog, "count": len(catalog.Entries)}, nil
-
 	case "install":
-		sourceRequest, err := s.sourceRequest(request)
+		source, err := s.sourcePath(request.Source)
 		if err != nil {
 			return nil, err
 		}
@@ -183,7 +201,7 @@ func (s *Service) Manage(ctx context.Context, request ManageRequest) (Result, er
 		if request.Enabled != nil {
 			enabled = *request.Enabled
 		}
-		result, err := s.manager.InstallReviewedSource(ctx, sourceRequest, enabled, request.ReviewToken)
+		result, err := s.manager.InstallReviewedSource(ctx, source, enabled, request.ReviewToken)
 		if err != nil {
 			return nil, pluginToolError(err)
 		}
@@ -225,14 +243,14 @@ func (s *Service) Manage(ctx context.Context, request ManageRequest) (Result, er
 		return changeResult(result), nil
 
 	case "update":
-		sourceRequest, err := s.sourceRequest(request)
+		source, err := s.sourcePath(request.Source)
 		if err != nil {
 			return nil, err
 		}
 		var previous pluginruntime.State
 		deactivated := false
 		var deactivationErr error
-		result, err := s.manager.UpdateReviewedSource(ctx, sourceRequest, request.ConfirmedSourceChange, request.ReviewToken, func(state pluginruntime.State) error {
+		result, err := s.manager.UpdateReviewedSource(ctx, source, request.ReviewToken, func(state pluginruntime.State) error {
 			previous = state
 			if !state.Enabled {
 				return nil
@@ -339,60 +357,41 @@ func (s *Service) Manage(ctx context.Context, request ManageRequest) (Result, er
 			"INVALID_ACTION",
 			"unsupported plugin_manage action",
 			"validation",
-			map[string]any{"action": action, "allowed": []string{"list", "inspect", "validate", "install", "update", "enable", "disable", "remove", "catalog"}},
+			map[string]any{"action": action, "allowed": []string{"list", "inspect", "validate", "install", "update", "enable", "disable", "remove"}},
 		)
 	}
 }
 
-func (s *Service) sourceRequest(request ManageRequest) (pluginruntime.SourceRequest, error) {
-	source := strings.TrimSpace(request.Source)
+func (s *Service) sourcePath(raw string) (string, error) {
+	source := strings.TrimSpace(raw)
 	if source == "" {
-		return pluginruntime.SourceRequest{}, validationError("source is required", "source")
+		return "", validationError("source is required", "source")
 	}
-	sourceType := strings.ToLower(strings.TrimSpace(request.SourceType))
-	if sourceType == "" {
-		sourceType = "auto"
+	if strings.Contains(source, "://") {
+		return "", validationError("source must be a local Plugin directory or ZIP archive", "source")
 	}
-	if strings.TrimSpace(request.CatalogItem) != "" && sourceType == "auto" {
-		sourceType = "catalog"
+	resolved, err := s.ws.ResolveExisting(source)
+	if err != nil {
+		return "", toolcore.NewErrorCause(
+			"PLUGIN_SOURCE_INVALID",
+			"Plugin source cannot be resolved",
+			"validation",
+			map[string]any{"source": source},
+			err,
+		)
 	}
-	if (sourceType == "local" || sourceType == "catalog" || sourceType == "git" || sourceType == "archive" || sourceType == "auto") &&
-		!strings.Contains(source, "://") && !pluginruntime.IsSCPLikeGitSource(source) {
-		resolved, err := s.ws.ResolveExisting(source)
-		if err != nil {
-			if sourceType == "git" {
-				return pluginruntime.SourceRequest{}, toolcore.NewErrorCause("PLUGIN_SOURCE_INVALID", "local Git source cannot be resolved", "validation", map[string]any{"source": source}, err)
-			}
-			if sourceType == "local" || sourceType == "catalog" || sourceType == "archive" || sourceType == "auto" {
-				return pluginruntime.SourceRequest{}, toolcore.NewErrorCause("PLUGIN_SOURCE_INVALID", "Plugin source cannot be resolved", "validation", map[string]any{"source": source}, err)
-			}
-		} else {
-			source = resolved.Abs
-			if sourceType == "auto" {
-				info, statErr := os.Lstat(source)
-				if statErr != nil {
-					return pluginruntime.SourceRequest{}, toolcore.NewErrorCause("PLUGIN_SOURCE_INVALID", "Plugin source cannot be inspected", "validation", map[string]any{"source": source}, statErr)
-				}
-				switch {
-				case info.IsDir() && info.Mode()&os.ModeSymlink == 0:
-					sourceType = "local"
-				case info.Mode().IsRegular() && strings.EqualFold(filepath.Ext(source), ".zip"):
-					sourceType = "archive"
-				default:
-					return pluginruntime.SourceRequest{}, validationError("auto source must be a Plugin directory, Git URL, or ZIP archive", "source")
-				}
-			}
-		}
+	info, err := os.Lstat(resolved.Abs)
+	if err != nil {
+		return "", toolcore.NewErrorCause("PLUGIN_SOURCE_INVALID", "Plugin source cannot be inspected", "validation", map[string]any{"source": source}, err)
 	}
-	return pluginruntime.SourceRequest{
-		Type: sourceType, Ref: source,
-		GitRef: strings.TrimSpace(request.GitRef), GitCommit: strings.TrimSpace(request.GitCommit),
-		Subdir: strings.TrimSpace(request.Subdir), SHA256: strings.TrimSpace(request.SHA256),
-		Adapter: strings.TrimSpace(request.SourceAdapter), Version: strings.TrimSpace(request.SourceVersion),
-		Catalog: strings.TrimSpace(request.Catalog), CatalogItem: strings.TrimSpace(request.CatalogItem),
-	}, nil
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", validationError("source must not be a symlink", "source")
+	}
+	if info.IsDir() || info.Mode().IsRegular() && strings.EqualFold(filepath.Ext(resolved.Abs), ".zip") {
+		return resolved.Abs, nil
+	}
+	return "", validationError("source must be a local Portable Plugin directory or ZIP archive", "source")
 }
-
 func (s *Service) ownedMCPConfigs(excludedPlugin, activationPlugin string, override *pluginruntime.Installed) ([]mcpclient.ServerConfig, map[string]func(), error) {
 	installed, err := s.manager.List()
 	if err != nil {
@@ -405,12 +404,15 @@ func (s *Service) ownedMCPConfigs(excludedPlugin, activationPlugin string, overr
 		return nil, nil, err
 	}
 	add := func(item pluginruntime.Installed, release func()) error {
-		pluginConfigs, err := s.mcpConfigsForInstalled(item)
+		pluginConfigs, cleanup, err := s.mcpConfigsForInstalled(item)
 		if err != nil {
 			release()
 			return err
 		}
-		leases[item.Name] = release
+		leases[item.Name] = func() {
+			cleanup()
+			release()
+		}
 		configs = append(configs, pluginConfigs...)
 		return nil
 	}
@@ -453,41 +455,56 @@ func (s *Service) ownedMCPConfigs(excludedPlugin, activationPlugin string, overr
 	return configs, leases, nil
 }
 
-func (s *Service) mcpConfigsForInstalled(item pluginruntime.Installed) ([]mcpclient.ServerConfig, error) {
+func (s *Service) mcpConfigsForInstalled(item pluginruntime.Installed) ([]mcpclient.ServerConfig, func(), error) {
 	dataDir, err := s.manager.EnsureDataDir(item.Name)
 	if err != nil {
-		return nil, fmt.Errorf("prepare Plugin data directory for %s: %w", item.Name, err)
+		return nil, nil, fmt.Errorf("prepare Plugin data directory for %s: %w", item.Name, err)
 	}
 	pkg, err := pluginruntime.LoadPackage(item.Root)
 	if err != nil {
-		return nil, fmt.Errorf("load installed Plugin %s MCP config: %w", item.Name, err)
+		return nil, nil, fmt.Errorf("load installed Plugin %s MCP config: %w", item.Name, err)
 	}
 	if pkg.Manifest.Name != item.Name || pkg.Manifest.Version != item.Version || pkg.PackageDigest != item.PackageDigest {
-		return nil, fmt.Errorf("installed Plugin %s package drifted from persisted state", item.Name)
+		return nil, nil, fmt.Errorf("installed Plugin %s package drifted from persisted state", item.Name)
+	}
+
+	runtimeRoot := item.Root
+	cleanup := func() {}
+	for _, component := range pkg.Components.MCP {
+		if component.Transport != mcpclient.TransportStdio {
+			continue
+		}
+		runtimeRoot, err = s.manager.Store().SnapshotRuntimePackage(item.Root)
+		if err != nil {
+			return nil, nil, fmt.Errorf("snapshot Plugin %s stdio runtime: %w", item.Name, err)
+		}
+		cleanup = func() { _ = os.RemoveAll(runtimeRoot) }
+		break
 	}
 
 	configs := make([]mcpclient.ServerConfig, 0, len(pkg.Components.MCP))
 	for _, component := range pkg.Components.MCP {
 		command := component.Command
 		if strings.HasPrefix(filepath.ToSlash(command), "./") {
-			command = filepath.Join(item.Root, filepath.FromSlash(strings.TrimPrefix(filepath.ToSlash(command), "./")))
+			command = filepath.Join(runtimeRoot, filepath.FromSlash(strings.TrimPrefix(filepath.ToSlash(command), "./")))
 		}
 		args := make([]string, len(component.Args))
 		for index, value := range component.Args {
-			args[index] = expandPortablePluginValue(value, item.Root, dataDir)
+			args[index] = expandPortablePluginValue(value, runtimeRoot, dataDir)
 		}
 		staticEnv := make(map[string]string, len(component.Environment))
 		for key, value := range component.Environment {
-			staticEnv[key] = expandPortablePluginValue(value, item.Root, dataDir)
+			staticEnv[key] = expandPortablePluginValue(value, runtimeRoot, dataDir)
 		}
 		cwd := ""
 		if component.Transport == mcpclient.TransportStdio {
-			cwd = item.Root
+			cwd = runtimeRoot
 			if component.CWD != "" {
-				cwd = expandPortablePluginValue(component.CWD, item.Root, dataDir)
+				cwd = expandPortablePluginValue(component.CWD, runtimeRoot, dataDir)
 			}
-			if err := validateActivatedPluginCWD(cwd, component.CWD, item.Root, dataDir); err != nil {
-				return nil, fmt.Errorf("activate Plugin MCP %s/%s cwd: %w", item.Name, component.Name, err)
+			if err := validateActivatedPluginCWD(cwd, component.CWD, runtimeRoot, dataDir); err != nil {
+				cleanup()
+				return nil, nil, fmt.Errorf("activate Plugin MCP %s/%s cwd: %w", item.Name, component.Name, err)
 			}
 		}
 		configs = append(configs, mcpclient.ServerConfig{
@@ -496,11 +513,12 @@ func (s *Service) mcpConfigsForInstalled(item pluginruntime.Installed) ([]mcpcli
 			URL: component.URL, Command: command, Args: args, Cwd: cwd,
 			StaticEnv: staticEnv, StaticHeaders: cloneMap(component.Headers),
 			HeaderEnv: cloneMap(component.HeaderEnv), EnvBindings: cloneMap(component.EnvBindings),
-			StorageKey: component.StorageKey, SourceType: "plugin", PluginName: item.Name,
-			PluginRoot: item.Root, PluginDataDir: dataDir, Enabled: true, TimeoutMS: component.TimeoutMS,
+			RequiredEnv: append([]string(nil), component.RequiredEnv...),
+			StorageKey:  component.StorageKey, SourceType: "plugin", PluginName: item.Name,
+			PluginRoot: runtimeRoot, PluginDataDir: dataDir, Enabled: true, TimeoutMS: component.TimeoutMS,
 		})
 	}
-	return configs, nil
+	return configs, cleanup, nil
 }
 
 func expandPortablePluginValue(value, pluginRoot, pluginData string) string {
