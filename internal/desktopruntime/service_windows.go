@@ -18,11 +18,6 @@ import (
 	processcontrol "github.com/uvwt/agentdock/internal/process"
 )
 
-// Windows 冷启动可能同时经过 InteractiveToken 计划任务、DPAPI 配置恢复和 Runtime/Plugin 重建。
-// 更新 trial 也复用 service start 等待目标 Core；45 秒在真实云主机冷启动中已经出现边界误回滚。
-// 这里给冷启动增加 15 秒余量，同时保留明确失败上界；上层 Update Arbiter 仍有独立的总事务预算。
-const windowsCoreStartTimeout = 60 * time.Second
-
 func platformServiceStatus(ctx context.Context, runtimeRoot string) (ServiceStatus, error) {
 	manifest, _, err := loadDesktopManifest(runtimeRoot)
 	if err != nil {
@@ -85,7 +80,7 @@ func startCore(ctx context.Context, manifest Manifest, runtimeRoot string) error
 	} else if err := startDetachedCore(manifest, runtimeRoot); err != nil {
 		return err
 	}
-	return waitForHealth(ctx, manifest.HealthURL(), windowsCoreStartTimeout)
+	return waitForHealth(ctx, manifest.HealthURL(), WindowsCoreStartTimeout)
 }
 
 func stopCore(ctx context.Context, manifest Manifest, runtimeRoot string) error {
@@ -103,7 +98,7 @@ func stopCore(ctx context.Context, manifest Manifest, runtimeRoot string) error 
 		return fmt.Errorf("识别 Tunnel supervisor 失败: %w", err)
 	}
 	if supervisorPID != 0 {
-		// Core 与 Tunnel supervisor 共用 agentdock.exe。停止 Core 时必须保留 supervisor，
+		// Core 与 Tunnel supervisor 共用当前 generation Core 二进制。停止 Core 时必须保留 supervisor，
 		// 否则一次普通 Core 重启就会悄悄丢失 Tunnel 的后续自恢复能力。
 		excluded[supervisorPID] = struct{}{}
 	}
