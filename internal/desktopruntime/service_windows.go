@@ -14,9 +14,14 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows"
+
+	processcontrol "github.com/uvwt/agentdock/internal/process"
 )
 
-const windowsCoreStartTimeout = 45 * time.Second
+// Windows 冷启动可能同时经过 InteractiveToken 计划任务、DPAPI 配置恢复和 Runtime/Plugin 重建。
+// 更新 trial 也复用 service start 等待目标 Core；45 秒在真实云主机冷启动中已经出现边界误回滚。
+// 这里给冷启动增加 15 秒余量，同时保留明确失败上界；上层 Update Arbiter 仍有独立的总事务预算。
+const windowsCoreStartTimeout = 60 * time.Second
 
 func platformServiceStatus(ctx context.Context, runtimeRoot string) (ServiceStatus, error) {
 	manifest, _, err := loadDesktopManifest(runtimeRoot)
@@ -93,7 +98,7 @@ func stopCore(ctx context.Context, manifest Manifest, runtimeRoot string) error 
 	for processID := range ancestorPIDs {
 		excluded[processID] = struct{}{}
 	}
-	supervisorPID, err := activeTunnelSupervisorPID(runtimeRoot, coreBinary)
+	supervisorPID, err := activeTunnelSupervisorPIDForRuntime(runtimeRoot, manifest)
 	if err != nil {
 		return fmt.Errorf("识别 Tunnel supervisor 失败: %w", err)
 	}
@@ -132,6 +137,7 @@ func startDetachedCore(manifest Manifest, runtimeRoot string) error {
 		HideWindow:    true,
 		CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.DETACHED_PROCESS,
 	}
+	processcontrol.Configure(command)
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("启动 AgentDock 核心失败: %w", err)
 	}
